@@ -1,6 +1,6 @@
 # -----------------------------------------------------------------------------
 # 工作流目的说明：
-# 此工作流用于监听仓库 main 分支上常见压缩文件格式的推送事件。
+# 此工作流用于监听仓库 main/master/GM82 分支上常见压缩文件格式的推送事件。
 # 当检测到 .zip, .7z, .rar, .tar, .tar.gz, .tgz, .tar.bz2, .tar.xz 文件时，
 # 工作流会自动检出代码，安装必要的解压工具（如 7z 和 unrar），
 # 然后为每个压缩包创建一个同名的独立文件夹，在其中执行解压操作。
@@ -47,41 +47,47 @@ jobs:
 
       - name: 查找、原地解压、强制添加并删除压缩包
         run: |
-          echo "开始查找仓库中的受支持压缩文件..."
+          set -euo pipefail
 
-          ARCHIVES=$(find . -type f $$ \
-            -iname "*.zip" -o \
-            -iname "*.7z" -o \
-            -iname "*.rar" -o \
-            -iname "*.tar" -o \
-            -iname "*.tar.gz" -o \
-            -iname "*.tgz" -o \
-            -iname "*.tar.bz2" -o \
-            -iname "*.tar.xz" \
-          $$ -not -path "./.git/*")
+          echo "===== 调试信息 ====="
+          echo "当前工作目录: $(pwd)"
+          echo "Bash 版本: ${BASH_VERSION}"
+          echo "===================="
+          echo ""
 
-          if [ -z "$ARCHIVES" ]; then
+          # ------------------------------------------------------------------
+          # 将 find 结果写入临时文件，避免 YAML 续行和管道子 shell 的所有隐患
+          # find 命令保持单行，杜绝 \ 续行 + 尾部空白导致的解析错误
+          # ------------------------------------------------------------------
+          find . -type f $$ -iname "*.zip" -o -iname "*.7z" -o -iname "*.rar" -o -iname "*.tar" -o -iname "*.tar.gz" -o -iname "*.tgz" -o -iname "*.tar.bz2" -o -iname "*.tar.xz" $$ -not -path "./.git/*" > /tmp/archives_list.txt
+
+          ARCHIVE_COUNT=$(wc -l < /tmp/archives_list.txt)
+
+          if [ "$ARCHIVE_COUNT" -eq 0 ]; then
             echo "未在此次检出的代码中找到支持的压缩文件。"
             exit 0
           fi
 
-          echo "找到以下压缩文件并准备处理:"
-          echo "$ARCHIVES"
+          echo "找到 $ARCHIVE_COUNT 个压缩文件:"
+          cat /tmp/archives_list.txt
           echo "---"
 
           HAS_ERROR=0
 
-          echo "$ARCHIVES" | while read -r FILE; do
+          # ------------------------------------------------------------------
+          # 从临时文件逐行读取（不在管道子 shell 中，变量修改可保留）
+          # ------------------------------------------------------------------
+          while IFS= read -r FILE; do
             [ -f "$FILE" ] || continue
 
             TARGET_DIR=$(dirname "$FILE")
             FILENAME=$(basename "$FILE")
             LOWER_FILE=$(echo "$FILENAME" | tr '[:upper:]' '[:lower:]')
 
-            # ------------------------------------------------------------------
-            # 根据完整后缀名，剥离扩展得到不含后缀的文件名，
-            # 以此作为独立解压文件夹的名称
-            # ------------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # 根据完整后缀名剥离扩展，得到不含后缀的文件名
+            # 优先匹配长后缀（如 *.tar.gz 优先于 *.tar）
+            # ----------------------------------------------------------------
             case "$LOWER_FILE" in
               *.tar.gz)  BASENAME="${FILENAME%.tar.gz}" ;;
               *.tar.bz2) BASENAME="${FILENAME%.tar.bz2}" ;;
@@ -98,12 +104,13 @@ jobs:
             DEST_DIR="$TARGET_DIR/$BASENAME"
             mkdir -p "$DEST_DIR"
 
+            echo ""
             echo "正在处理: $FILE"
             echo "  -> 解压到独立目录: $DEST_DIR"
 
-            # ------------------------------------------------------------------
-            # 执行解压；无论成功与否都不退出循环，而是记录状态
-            # ------------------------------------------------------------------
+            # ----------------------------------------------------------------
+            # 执行解压；失败则记录并继续，不中断整个流程
+            # ----------------------------------------------------------------
             EXTRACT_OK=0
 
             case "$LOWER_FILE" in
@@ -137,7 +144,7 @@ jobs:
             if [ "$EXTRACT_OK" -eq 0 ]; then
               echo "  -> 解压成功。"
 
-              # 暂存解压目录中的所有文件（强制，忽略 .gitignore）
+              # 暂存该专属目录中的所有文件（强制，忽略 .gitignore）
               echo "  -> 暂存 $DEST_DIR 中的文件..."
               git add --force "$DEST_DIR"
 
@@ -148,14 +155,18 @@ jobs:
             else
               echo "  -> ⚠ 解压 $FILE 失败，跳过该文件，继续处理其余压缩包。"
               HAS_ERROR=1
-
-              # 如果专属文件夹为空则清理掉
+              # 清理空的专属文件夹
               rmdir "$DEST_DIR" 2>/dev/null || true
             fi
-          done
 
+          done < /tmp/archives_list.txt
+
+          echo ""
           echo "---"
           echo "所有受支持的压缩文件处理完毕。"
+
+          # 清理临时文件
+          rm -f /tmp/archives_list.txt
 
       - name: 提交变动
         run: |
