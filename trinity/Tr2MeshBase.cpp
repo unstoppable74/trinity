@@ -1,0 +1,624 @@
+// Copyright © 2014 CCP ehf.
+
+#include "StdAfx.h"
+#include "Tr2MeshBase.h"
+#include "Resources/TriGeometryRes.h"
+#include "Utilities/BoundingBox.h"
+#include "Raytracing/Tr2RaytracingGeometry.h"
+
+CCP_STATS_DECLARE( tr2MeshBindToRig, "Trinity/BindToRig", true, CST_COUNTER_LOW, "Number of times a mesh executed bind to a new rig" );
+
+Tr2MeshBase::Tr2MeshBase( IRoot* lockobj ) :
+	PARENTLOCK( m_opaqueAreas ),
+	PARENTLOCK( m_decalAreas ),
+	PARENTLOCK( m_depthAreas ),
+	PARENTLOCK( m_transparentAreas ),
+	PARENTLOCK( m_additiveAreas ),
+	PARENTLOCK( m_pickableAreas ),
+	PARENTLOCK( m_mirrorAreas ),
+	PARENTLOCK( m_geometryEraserAreas ),
+	PARENTLOCK( m_decalNormalAreas ),
+	PARENTLOCK( m_depthNormalAreas ),
+	PARENTLOCK( m_opaquePrepassAreas ),
+	PARENTLOCK( m_decalPrepassAreas ),
+	PARENTLOCK( m_flareAreas ),
+	PARENTLOCK( m_distortionAreas ),
+	m_display( true ),
+	m_meshIndex( 0 ),
+	m_pBoneList( NULL ),
+	m_numBones( 0 )
+{
+	m_opaqueAreas.SetNotify( this );
+	m_decalAreas.SetNotify( this );
+	m_depthAreas.SetNotify( this );
+	m_transparentAreas.SetNotify( this );
+	m_additiveAreas.SetNotify( this );
+	m_pickableAreas.SetNotify( this );
+	m_mirrorAreas.SetNotify( this );
+	m_depthNormalAreas.SetNotify( this );
+	m_opaquePrepassAreas.SetNotify( this );
+	m_decalPrepassAreas.SetNotify( this );
+	m_geometryEraserAreas.SetNotify( this );
+	m_distortionAreas.SetNotify( this );
+	for( int i = 0; i < TRIBATCHTYPE_COUNT_OF_BATCH_TYPES; ++i )
+	{
+		m_areaLookupArray[i] = NULL;
+	}
+
+	m_areaLookupArray[TRIBATCHTYPE_OPAQUE] = &m_opaqueAreas;
+	m_areaLookupArray[TRIBATCHTYPE_DECAL] = &m_decalAreas;
+	m_areaLookupArray[TRIBATCHTYPE_TRANSPARENT] = &m_transparentAreas;
+	m_areaLookupArray[TRIBATCHTYPE_DEPTH] = &m_depthAreas;
+	m_areaLookupArray[TRIBATCHTYPE_ADDITIVE] = &m_additiveAreas;
+	m_areaLookupArray[TRIBATCHTYPE_PICKING] = &m_pickableAreas;
+	m_areaLookupArray[TRIBATCHTYPE_MIRROR] = &m_mirrorAreas;
+	m_areaLookupArray[TRIBATCHTYPE_DECALNORMAL] = &m_decalNormalAreas;
+	m_areaLookupArray[TRIBATCHTYPE_DEPTHNORMAL] = &m_depthNormalAreas;
+	m_areaLookupArray[TRIBATCHTYPE_OPAQUE_PREPASS] = &m_opaquePrepassAreas;
+	m_areaLookupArray[TRIBATCHTYPE_DECAL_PREPASS] = &m_decalPrepassAreas;
+	m_areaLookupArray[TRIBATCHTYPE_GEOMETRY_ERASER] = &m_geometryEraserAreas;
+	m_areaLookupArray[TRIBATCHTYPE_FLARE] = &m_flareAreas;
+	m_areaLookupArray[TRIBATCHTYPE_DISTORTION] = &m_distortionAreas;
+}
+
+
+Tr2MeshBase::~Tr2MeshBase()
+{
+	for( auto& list : m_areaLookupArray )
+	{
+		for( auto& area : *list )
+		{
+			area->RemoveOwnerMesh( this );
+		}
+	}
+}
+
+void Tr2MeshBase::OnListModified(
+	long event,
+	ssize_t key,
+	ssize_t key2,
+	IRoot* value,
+	const IList* list )
+{
+	switch( event & BELIST_EVENTMASK )
+	{
+	case BELIST_INSERTED:
+		if( Tr2MeshAreaPtr area = BlueCastPtr( value ) )
+		{
+			area->AddOwnerMesh( this );
+		}
+		break;
+	case BELIST_REMOVED:
+		if( Tr2MeshAreaPtr area = BlueCastPtr( value ) )
+		{
+			area->RemoveOwnerMesh( this );
+		}
+		break;
+	case BELIST_LOADFINISHED:
+		for( ssize_t i = 0; i < list->GetSize(); ++i )
+		{
+			if( Tr2MeshAreaPtr entity = BlueCastPtr( list->GetAt( i ) ) )
+			{
+				entity->AddOwnerMesh( this );
+			}
+		}
+		break;
+	case BELIST_UNLOADSTART:
+		for( ssize_t i = 0; i < list->GetSize(); ++i )
+		{
+			if( Tr2MeshAreaPtr entity = BlueCastPtr( list->GetAt( i ) ) )
+			{
+				entity->RemoveOwnerMesh( this );
+			}
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+unsigned int Tr2MeshBase::FindJoint( const std::string* boneList, const int numBones, const char* name ) const
+{
+	if( boneList && name )
+	{
+		for( int ix = 0; ix < numBones; ++ix )
+		{
+			if( strcmp( name, boneList[ix].c_str() ) == 0 )
+			{
+				return ix;
+			}
+		}
+	}
+	return 0xffffffff;
+}
+
+bool Tr2MeshBase::BindToRig( const std::string* boneList, const int numBones, TriGeometryResSkeletonData* renderRig, bool forceRebind )
+{
+	CCP_STATS_ZONE( "Tr2Mesh::BindToRig" );
+
+	CCP_STATS_INC( tr2MeshBindToRig );
+
+	forceRebind |= m_forcedRebind;
+	m_forcedRebind = false;
+
+	if( !GetGeometryResource() || !GetGeometryResource()->IsPrepared() )
+	{
+		return false;
+	}
+
+	if( ( m_pBoneList == boneList ) && ( m_renderRig == renderRig ) && ( m_numBones == numBones ) && !forceRebind )
+	{
+		return true;
+	}
+
+	TriGeometryResMeshData* meshData = GetGeometryResource()->GetMeshData( m_meshIndex );
+	if( !meshData )
+	{
+		// resource is prepard but mesh doesn't exist, this can happen for ragdoll dummy boxshapes.
+		// don't trigger continuous rebindings, return true.
+		return true;
+	}
+
+	// keep this array here as member
+	unsigned int n = (unsigned int)meshData->m_jointBindings.size();
+	m_jointMappingAnimRig.resize( n );
+
+	for( unsigned int j = 0; j < m_jointMappingAnimRig.size(); ++j )
+	{
+		const char* name = meshData->m_jointBindings[j].m_name.c_str();
+
+		m_jointMappingAnimRig[j] = FindJoint( boneList, numBones, name );
+
+		while( m_jointMappingAnimRig[j] == 0xffffffff )
+		{
+			unsigned int renderIndex = renderRig->FindJoint( name );
+			if( renderIndex != 0xffffffff )
+			{
+				unsigned int parentIndex = renderRig->m_joints[renderIndex].m_parentJoint;
+				if( parentIndex != 0xffffffff )
+				{
+					const char* parentName = renderRig->m_joints[parentIndex].m_name.c_str();
+					m_jointMappingAnimRig[j] = FindJoint( boneList, numBones, parentName );
+					name = parentName;
+				}
+				else
+				{
+					CCP_LOGWARN( "Resource %s - attempted to bind a joint that was not found on the render rig: %s", meshData->m_name.c_str(), name );
+					break;
+				}
+			}
+			else
+			{
+				CCP_LOGWARN( "Resource %s - attempted to bind a joint that was not found on the render rig: %s", meshData->m_name.c_str(), name );
+				break;
+			}
+		}
+	}
+
+	for( int i = 0; i < TRIBATCHTYPE_COUNT_OF_BATCH_TYPES; ++i )
+	{
+		if( m_areaLookupArray[i] )
+		{
+			for( PTr2MeshAreaVector::iterator it = m_areaLookupArray[i]->begin(); it != m_areaLookupArray[i]->end(); ++it )
+			{
+				( *it )->SetJointMappingAnimRig( &m_jointMappingAnimRig[0] );
+				( *it )->SetJointCount( n );
+			}
+		}
+	}
+
+	// set this so we only do this once!
+	m_pBoneList = boneList;
+	m_renderRig = renderRig;
+	m_numBones = numBones;
+
+	return true;
+}
+
+CcpMath::AxisAlignedBox Tr2MeshBase::GetBounds( const Matrix* boneTransforms, const int32_t* meshBindingIndices, size_t boneCount, const Tr2MorphTargetAnimationData* morphTargets, size_t morphTargetsCount ) const
+{
+	if( boneTransforms )
+	{
+		if( auto geometry = GetGeometryResource() )
+		{
+			TriGeometryResMeshData* meshData = geometry->GetMeshData( m_meshIndex );
+			TriGeometryResLodData* lod = geometry->GetMeshLod( m_meshIndex, 0 );
+
+			if( !m_jointMappingAnimRig.empty() )
+			{
+				// for old character stuff
+				boneCount = m_jointMappingAnimRig.size();
+				meshBindingIndices = (const int32_t*)m_jointMappingAnimRig.data();
+			}
+
+			if( meshData && boneCount > 0 )
+			{
+				auto aabb = CcpMath::AxisAlignedBox();
+				for( size_t i = 0; i < boneCount; ++i )
+				{
+					auto& joint = meshData->m_jointBindings[i];
+					auto& m = boneTransforms[meshBindingIndices[i]];
+
+					Vector3 rightMin = m.GetX() * joint.m_obbMin.x;
+					Vector3 upMin = m.GetY() * joint.m_obbMin.y;
+					Vector3 forwardMin = m.GetZ() * joint.m_obbMin.z;
+					Vector3 rightMax = m.GetX() * joint.m_obbMax.x;
+					Vector3 upMax = m.GetY() * joint.m_obbMax.y;
+					Vector3 forwardMax = m.GetZ() * joint.m_obbMax.z;
+					Vector3 translation = m.GetTranslation();
+
+					Vector3 a;
+					a.x = min( rightMin.x, rightMax.x ) + min( upMin.x, upMax.x ) + min( forwardMin.x, forwardMax.x ) + translation.x;
+					a.y = min( rightMin.y, rightMax.y ) + min( upMin.y, upMax.y ) + min( forwardMin.y, forwardMax.y ) + translation.y;
+					a.z = min( rightMin.z, rightMax.z ) + min( upMin.z, upMax.z ) + min( forwardMin.z, forwardMax.z ) + translation.z;
+					aabb.IncludePoint( a );
+
+					Vector3 b;
+					b.x = max( rightMin.x, rightMax.x ) + max( upMin.x, upMax.x ) + max( forwardMin.x, forwardMax.x ) + translation.x;
+					b.y = max( rightMin.y, rightMax.y ) + max( upMin.y, upMax.y ) + max( forwardMin.y, forwardMax.y ) + translation.y;
+					b.z = max( rightMin.z, rightMax.z ) + max( upMin.z, upMax.z ) + max( forwardMin.z, forwardMax.z ) + translation.z;
+					aabb.IncludePoint( b );
+				}
+
+				float morphDeformation = 0.f;
+				for( size_t i = 0; i < morphTargetsCount; i++ )
+				{
+					auto morph = morphTargets[i];
+					CCP_ASSERT_M( morph.m_index < lod->m_morphTargetDeformationAmounts.size(), "Tr2MeshBase::GetBounds: morph.m_index is too large!" );
+					morphDeformation += lod->m_morphTargetDeformationAmounts[morph.m_index] * morph.m_weight;
+				}
+				aabb.Grow( morphDeformation );
+
+				return m_boundsAdjustment.AdjustBounds( aabb );
+			}
+		}
+	}
+	return m_cachedBounds;
+}
+
+CcpMath::AxisAlignedBox Tr2MeshBase::GetAreaBounds( unsigned int areaIx, const Matrix* boneTransforms ) const
+{
+	CcpMath::AxisAlignedBox areaAabb;
+	auto geometry = GetGeometryResource();
+	if( !geometry || !geometry->GetAreaBoundingBox( m_meshIndex, areaIx, areaAabb.m_min, areaAabb.m_max ) )
+	{
+		return CcpMath::AxisAlignedBox();
+	}
+
+	if( boneTransforms )
+	{
+		TriGeometryResMeshData* meshData = geometry->GetMeshData( m_meshIndex );
+		if( meshData && !m_jointMappingAnimRig.empty() )
+		{
+			auto aabb = CcpMath::AxisAlignedBox();
+			for( size_t i = 0; i < m_jointMappingAnimRig.size(); ++i )
+			{
+				auto& joint = meshData->m_jointBindings[i];
+				auto& m = boneTransforms[m_jointMappingAnimRig[i]];
+
+				if( auto box = Intersection( areaAabb, CcpMath::AxisAlignedBox( joint.m_obbMin, joint.m_obbMax ) ) )
+				{
+					box.EnumerateVertices( [&]( const Vector3& vtx ) {
+						aabb.IncludePoint( TransformCoord( vtx, m ) );
+					} );
+				}
+			}
+			areaAabb = aabb;
+		}
+	}
+	return m_boundsAdjustment.AdjustBounds( areaAabb );
+}
+
+void Tr2MeshBase::CacheBounds()
+{
+	auto geometry = GetGeometryResource();
+	if( !geometry || !geometry->GetBoundingBox( m_meshIndex, m_cachedBounds.m_min, m_cachedBounds.m_max ) )
+	{
+		m_cachedBounds = CcpMath::AxisAlignedBox();
+		return;
+	}
+
+	m_cachedBounds = m_boundsAdjustment.AdjustBounds( m_cachedBounds );
+}
+
+bool Tr2MeshBase::GetBoundingBox( Vector3& min, Vector3& max ) const
+{
+	if( auto aabb = GetBounds() )
+	{
+		min = aabb.m_min;
+		max = aabb.m_max;
+		return true;
+	}
+	return false;
+}
+
+// --------------------------------------------------------------------------------
+bool Tr2MeshBase::GetDisplay() const
+{
+	return m_display;
+}
+
+Tr2RenderBatch CreateGeometryBatch( TriGeometryResLodData* lod, Tr2MeshArea* area, const Tr2PerObjectData* data, bool reverseWinding )
+{
+	Tr2RenderBatch batch;
+
+	if( !area->GetDisplay() || !lod->m_allocationsValid )
+	{
+		return batch;
+	}
+
+	auto shadMat = area->GetMaterialInterface();
+	if( !shadMat || !shadMat->GetShaderStateInterface() )
+	{
+		return batch;
+	}
+
+	auto primCount = GetPrimitiveCount( *lod, std::max( 0, area->GetIndex() ), std::max( 0, area->GetCount() ) );
+
+	if( !primCount )
+	{
+		return batch;
+	}
+
+	auto& meshArea = lod->m_areas[std::max( 0, area->GetIndex() )];
+	const bool reversed = area->GetReversed() != reverseWinding;
+
+	if( reversed && !lod->m_reversedIndicesValid )
+	{
+		return batch;
+	}
+
+	batch.SetMaterial( shadMat );
+	batch.SetGeometry( lod->m_mesh->m_vertexDeclarationHandle, lod->m_vertexAllocation, lod->m_indexAllocation );
+
+	batch.SetPerObjectData( data );
+
+	auto& indices = reversed ? lod->m_reversedIndexAllocation : lod->m_indexAllocation;
+	uint32_t startIndex;
+	if( reversed )
+	{
+		startIndex = indices.GetStartIndex() + lod->m_primitiveCount * 3 - meshArea.m_firstIndex - primCount * 3;
+	}
+	else
+	{
+		startIndex = indices.GetStartIndex() + meshArea.m_firstIndex;
+	}
+
+	batch.SetDrawIndexedInstanced(
+		primCount * 3,
+		1,
+		startIndex,
+		lod->m_vertexAllocation.GetOffset() / lod->m_vertexAllocation.GetStride(),
+		0 );
+	return batch;
+}
+
+
+
+void Tr2MeshBase::GetBatches( ITriRenderBatchAccumulator* batches,
+							  const Tr2MeshAreaVector* areas,
+							  const Tr2PerObjectData* data,
+							  float screenSize,
+							  bool reverseWinding ) const
+{
+	if( !GetDisplay() )
+	{
+		return;
+	}
+
+	auto geometry = GetGeometryResource();
+	if( !geometry || !geometry->IsGood() )
+	{
+		return;
+	}
+	TriGeometryResLodData* lod = geometry->GetMeshLod( m_meshIndex, screenSize );
+
+	if( !lod || !lod->m_allocationsValid )
+	{
+		return;
+	}
+
+	for( auto& area : *areas )
+	{
+		if( auto batch = CreateGeometryBatch( lod, area, data, reverseWinding ) )
+		{
+			batch.SetPickingData( m_meshIndex, area->GetIndex() );
+			batches->Commit( batch );
+		}
+	}
+}
+
+// -------------------------------------------------------------
+// Description:
+//   Returns the respath to the currently used geometry. Might
+//   be LOD based.
+// -------------------------------------------------------------
+const wchar_t* Tr2MeshBase::GetGeometryResPath() const
+{
+	const TriGeometryRes* currentRes = GetGeometryResource();
+	if( !currentRes )
+	{
+		return L"";
+	}
+	return currentRes->GetPath();
+}
+
+// -------------------------------------------------------------
+// Description:
+//   Gets the mesh area vector, depending on the batch type
+//	 requested. Defaults to NULL if there is no vector for the given batch type.
+// Arguments:
+//	 areaType - the TriBatchType as enumerated in ITr2Renderable
+// -------------------------------------------------------------
+Tr2MeshAreaVector* Tr2MeshBase::GetAreas( TriBatchType areaType )
+{
+	return m_areaLookupArray[areaType];
+}
+
+// -------------------------------------------------------------
+// Description:
+//   Gets the mesh area vector, depending on the batch type
+//	 requested. Defaults to NULL if there is no vector for the given batch type.
+// Arguments:
+//	 areaType - the TriBatchType as enumerated in ITr2Renderable
+// -------------------------------------------------------------
+const Tr2MeshAreaVector* Tr2MeshBase::GetAreas( TriBatchType areaType ) const
+{
+	return m_areaLookupArray[areaType];
+}
+
+// -------------------------------------------------------------
+// Description:
+//   Put the very basic info of a mesharea (block) into the provided
+//   vector.
+// Arguments:
+//	 areaBlockVector - vector to append the block to
+//   areaType - only append area blocks from this block
+// -------------------------------------------------------------
+void Tr2MeshBase::CollectAreaBlocks( std::vector<TriRenderBatchAreaBlock>& collector, TriBatchType areaType ) const
+{
+	const Tr2MeshAreaVector* areas = GetAreas( areaType );
+	for( auto a = areas->begin(); a != areas->end(); ++a )
+	{
+		if( areaType == TRIBATCHTYPE_OPAQUE && !( *a )->IsCastingShadows() )
+		{
+			// skip non-shadow casting areas when collecting areas for overlay rendering: such areas may cause problems
+			// (for example scaffolding + build effect)
+			continue;
+		}
+		TriRenderBatchAreaBlock ab( std::max( 0, ( *a )->GetIndex() ), std::max( 0, ( *a )->GetCount() ) );
+		collector.push_back( ab );
+	}
+}
+
+// -------------------------------------------------------------
+// Description:
+//   Put the very basic info of a mesharea (block) into a class that contains the list of areas and a pointer to a material
+// -------------------------------------------------------------
+void Tr2MeshBase::CollectAreaBlocksWithSharedMaterials( std::vector<TriRenderBatchAreaBlocksWithSharedMaterial>& collectors, TriBatchType areaType ) const
+{
+	const Tr2MeshAreaVector* areas = GetAreas( areaType );
+	for( auto a = areas->begin(); a != areas->end(); ++a )
+	{
+		if( areaType == TRIBATCHTYPE_OPAQUE && !( *a )->IsCastingShadows() )
+		{
+			continue;
+		}
+		if( areaType == TRIBATCHTYPE_DECAL && !( *a )->IsCastingShadows() )
+		{
+			continue;
+		}
+
+		uint32_t i = 0;
+		for( ; i < collectors.size(); i++ )
+		{
+			if( collectors[i].m_shaderMaterial->GetHashValue() == ( *a )->GetMaterialInterface()->GetHashValue() )
+			{
+				break;
+			}
+		}
+		if( i == collectors.size() )
+		{
+			auto entry = TriRenderBatchAreaBlocksWithSharedMaterial();
+			entry.m_shaderMaterial = ( *a )->GetMaterialInterface();
+			collectors.push_back( entry );
+		}
+
+		TriRenderBatchAreaBlock ab( ( *a )->GetIndex(), ( *a )->GetCount() );
+		collectors[i].m_areaBlockVector.push_back( ab );
+	}
+}
+
+void Tr2MeshBase::SetShaderOption( const BlueSharedString& name, const BlueSharedString& value )
+{
+	const auto length = TRIBATCHTYPE_COUNT_OF_BATCH_TYPES;
+	for( auto i = 0; i < length; ++i )
+	{
+		const auto tribatchType = static_cast<TriBatchType>( i );
+		const auto area = GetAreas( tribatchType );
+		for( auto itInner = area->begin(); itInner != area->end(); ++itInner )
+		{
+			const Tr2MeshArea* area = *itInner;
+			const auto material = area->GetMaterialInterface();
+			if( nullptr != material )
+			{
+				material->SetOption( name, value );
+			}
+		}
+	}
+}
+
+void Tr2MeshBase::GetDebugOptions( Tr2DebugRendererOptions& options )
+{
+	options.insert( "Mesh Bounds" );
+}
+
+void Tr2MeshBase::RenderDebugInfo( const Matrix& worldTransform, ITr2DebugRenderer2& renderer, const Matrix* boneTransforms, const int32_t* meshBindingIndices, size_t boneCount, const Tr2MorphTargetAnimationData* morphTargets, size_t morphTargetsCount )
+{
+	if( renderer.HasOption( this, "Mesh Bounds" ) )
+	{
+		auto bounds = GetBounds( boneTransforms, meshBindingIndices, boneCount, morphTargets, morphTargetsCount );
+		renderer.DrawBox( this, worldTransform, bounds.m_min, bounds.m_max, Tr2DebugRenderer::Wireframe, Tr2DebugColor( 0xffaa8800, 0x22aa8800 ) );
+	}
+}
+
+std::vector<Tr2MeshAreaPtr> Tr2MeshBase::GetAllAreas() const
+{
+	std::vector<Tr2MeshAreaPtr> areas;
+	for( auto areaType : m_areaLookupArray )
+	{
+		if( areaType )
+		{
+			areas.insert( areas.end(), begin( *areaType ), end( *areaType ) );
+		}
+	}
+	return areas;
+}
+
+Tr2MaterialBoundsAdjustment Tr2MeshBase::GetMaterialBoundsAdjustment() const
+{
+	return m_boundsAdjustment;
+}
+
+void Tr2MeshBase::SetMaterialBoundsAdjustment( const Tr2MaterialBoundsAdjustment& adjustment )
+{
+	m_boundsAdjustment = adjustment;
+	CacheBounds();
+}
+
+void Tr2MeshBase::UseWithScreenSize( float screenSize, float worldRadius ) const
+{
+	if( auto geometry = GetGeometryResource() )
+	{
+		if( auto lod = geometry->GetMeshLod( m_meshIndex, screenSize ) )
+		{
+			for( auto areaType : m_areaLookupArray )
+			{
+				if( areaType )
+				{
+					for( auto& area : *areaType )
+					{
+						if( area && area->GetMaterialInterface() )
+						{
+							area->GetMaterialInterface()->UsedWithScreenSize( screenSize, worldRadius, lod->m_uvDensities );
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+Tr2RaytracingMesh* Tr2MeshBase::GetOrCreateRtMesh()
+{
+	if( !m_rtMesh )
+	{
+		m_rtMesh.reset( new Tr2RaytracingMesh() );
+	}
+	return m_rtMesh.get();
+}
+
+Tr2RaytracingMesh* Tr2MeshBase::GetRtMesh() const
+{
+	return m_rtMesh.get();
+}

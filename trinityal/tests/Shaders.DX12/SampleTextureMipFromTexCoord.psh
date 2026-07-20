@@ -1,0 +1,24 @@
+// Copyright © 2023 CCP ehf.
+
+struct VS_OUTPUT
+{
+	float4 Position : SV_Position;
+	float2 TexCoord : TEXCOORD;
+};
+
+cbuffer cb0: register( b0 )
+{
+  struct PerObjectPSData
+  {
+      float lod;
+  } PerObjectPS;
+}
+
+Texture2D tex0: register( t0 );
+SamplerState sampl: register( s0 );
+
+float4 main(VS_OUTPUT In) : SV_Target
+{
+    float4 color = tex0.SampleLevel( sampl, In.TexCoord, PerObjectPS.lod );
+    return color;
+}

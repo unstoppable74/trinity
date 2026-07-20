@@ -1,0 +1,17 @@
+// Copyright © 2023 CCP ehf.
+
+#include "MetalDefines.h"
+
+#include <metal_stdlib>
+using namespace metal;
+
+struct VS_OUTPUT
+{
+	float4 Position [[position]];
+};
+
+fragment float4 mainPS(VS_OUTPUT In [[stage_in]] )
+{
+    float4 color = float4( 1, 0, 0, 1 );
+    return color;
+}
